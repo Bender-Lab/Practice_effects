@@ -1,0 +1,133 @@
+
+setwd("C:/Users/...")
+
+library(ctsem)
+library(data.table)
+library(ggplot2)
+library(mltools)
+
+dat<-fread('MADC_data_dx_recoded.csv')
+dat=dat[which(dat$AD_MD == 1),]
+colnames(dat)[1]='id'
+
+vars=c(paste0('hvlt_t',1:4,'tc'))
+
+#configure time variable, collapse to full long format (1 observation occasion per row)
+dat$time <- as.numeric(as.POSIXct(dat$form_date,format='%m/%d/%Y'))
+dat$time <- dat$time - min(dat$time,na.rm=TRUE)
+
+dat$time = dat$time / 60 / 60/ 24 /365 + 10#convert to years and add 10 to allow time to get stationary distribution
+dat=dat[order(dat$id,dat$time),]
+
+mdat=data.table(dat)
+
+mdat[,obsCount:=(1:.N),by='id'] #counter of trials per subject
+mdat[,practice:=ifelse(obsCount==1,0,1)] #for very first trial, practice effect dummy is zero, otherwise 1.
+
+#create initial empty observation 
+extradat <- copy(mdat)
+extradat<-extradat[!duplicated(id),]
+extradat[,time:=time-10]
+extradat[,c(vars)] <- NA
+
+mdat <- rbind(mdat, extradat)
+mdat<-mdat[order(id,time),]
+
+# mdat$time <- mdat$time / 365
+
+
+mdat$agez <- scale(mdat$age)     #this might have to be changed according to the time-independent predictors
+
+DRIFT=matrix(0,5,5)
+DRIFT[row(DRIFT)==col(DRIFT)] <- 'selfFeedback||FALSE'
+DRIFT[1,1]='selfFeedback_practice|param|FALSE' #can set to 0.00 instead for simpler linear interpretations
+#DRIFT[1,1]=0
+MANIFESTVAR=matrix(0,4,4)
+MANIFESTVAR[row(MANIFESTVAR)==col(MANIFESTVAR)] <- 'resSD'
+
+#model spec - remove state dependence in TDPREDEFFECT to avoid compilation step (~2 minutes usually)
+m1 <- ctModel(
+  type='omx',Tpoints = 3,
+  TIpredNames = c('agez'),     #add other desired covariates here -- should be centered and scaled, in general
+  LAMBDA =
+    cbind('pracEffect||TRUE',c(1,0,0,0),c(0,1,0,0),c(0,0,1,0),c(0,0,0,1)),
+  manifestNames = vars,
+  MANIFESTVAR=MANIFESTVAR,
+  T0MEANS = 0,T0VAR = 0,
+  latentNames = c('practice',paste0('t',1:4)),
+  DRIFT=DRIFT,
+  TDpredNames = c('practice'),
+  TDPREDEFFECT = c(1,0,0,0,0))
+
+
+m1$DIFFUSION[,1]=0;
+m1$DIFFUSION[1,]=0;
+m1=ctStanModel(m1)
+# ctModelLatex(m1) #view model
+
+m1$tipredeffectscale <- .1 #set prior scale for covariate effects -- some regularisation helps convergence of optimiser when using multiple covariates
+
+
+#fit and summarise -- adjust cores according to system spec
+f <- ctStanFit(datalong = mdat,ctstanmodel = m1,
+               cores=8,
+               nopriors=F, #set to FALSE to use priors / regularisation
+               verbose=0,plot=10)
+
+f <- ctStanGenerateFromFit(fit = f, cores=1, nsamples = 200)
+#ctsem:::ctSummarise(f,cores=6) #outputs summary tables and plots to ctSummary folder
+
+summary(f)   
+
+cp=ctStanContinuousPars(f)
+cov2cor(cp$DIFFUSIONcov) #correlations in random (ie unpredictable) changes at every occasion
+
+#New
+#covariate expectations
+subjects=unique(mdat$id)
+sub_id=rep(1,nrow(mdat))
+for(i in 1: length(subjects))
+{
+  pos=which(mdat$id==subjects[i])
+  sub_id[pos]=i
+}
+mdat$sub_id = sub_id
+
+subject=11
+gg=ctsem:::ctKalmanTIP(f, subject=subject,plot=FALSE,kalmanvec='yprior') #get expectations for specific subject assuming high and low covariate values
+print(gg)+coord_cartesian(xlim=c(sort(mdat[sub_id %in% subject,time])[2],max(mdat[sub_id %in% subject,time]))) #limit plot to subjects observed time range
+
+
+
+#plots of subject predictions by time
+ctKalman(f,plot=T,subjects=11,polygonsteps=0,kalmanvec=c('y','yprior'))+coord_cartesian(xlim=c(10,15)) #expectations
+ctKalman(f,kalmanvec=c('etaprior'),removeObs = T,plot=T,polygonsteps=0,subjects=11:13)+coord_cartesian(xlim=c(10,20))#latent expectations
+
+
+
+#covariate expectations
+gg=ctsem:::ctKalmanTIP(f, subject=11,plot=FALSE,kalmanvec='etaprior')
+print(gg)
+
+#now do it Obs based
+gg=ctsem:::ctKalmanTIP(f, subject=11,plot=FALSE,returndat = TRUE,kalmanvec='etaprior')
+gg$Step <- rank(gg$Time)
+ggplot(data = gg,mapping = aes(y=Value,x=Step,linetype=Direction,colour=Covariate))+
+  geom_line(size=1)+
+  scale_colour_manual(values=c(1,2:length(unique(gg$Covariate))),
+                      labels=c('No covariate',levels(gg$Covariate)[-1]))+
+  facet_wrap(vars(Variable),scales = 'free_y')+theme_bw()+
+  coord_cartesian(xlim=c(250,290))
+
+
+
+
+subject=11
+gg=ctsem:::ctKalmanTIP(f, tipreds='agez',subject=subject,plot=FALSE,kalmanvec='etaprior') #get expectations for specific subject assuming high and low covariate values
+print(gg)+coord_cartesian(xlim=c(sort(mdat[id %in% subject,time])[2],max(mdat[id %in% subject,time]))) #limit plot to subjects observed time range
+
+subject=11
+gg=ctsem:::ctKalmanTIP(f, subject=subject,plot=FALSE,kalmanvec='yprior') #get expectations for specific subject assuming high and low covariate values
+print(gg)+coord_cartesian(xlim=c(sort(mdat[id %in% subject,time])[2],max(mdat[id %in% subject,time]))) #limit plot to subjects observed time range
+
+
